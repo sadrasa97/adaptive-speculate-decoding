@@ -78,10 +78,15 @@ class KVCacheCoordinator:
     def accept_tokens(self, n_accepted: int) -> int:
         sync_start = time.perf_counter()
         with self._lock:
+            # Always count as a sync (the +1 verified target token is always committed)
+            self.stats.total_syncs += 1
             if n_accepted <= 0:
+                self.stats.bytes_transferred += self._estimate_kv_bytes(1)
+                self.stats.total_sync_latency_ms += (time.perf_counter() - sync_start) * 1000.0
                 return self._committed_length
             n_accepted = min(n_accepted, len(self._draft_stack))
             if n_accepted == 0:
+                self.stats.total_sync_latency_ms += (time.perf_counter() - sync_start) * 1000.0
                 return self._committed_length
 
             accept_positions = self._draft_stack[:n_accepted]
@@ -91,8 +96,7 @@ class KVCacheCoordinator:
             for pos in accept_positions:
                 self._shadow_valid[pos] = True
 
-            self.stats.total_syncs += 1
-            self.stats.bytes_transferred += self._estimate_kv_bytes(n_accepted)
+            self.stats.bytes_transferred += self._estimate_kv_bytes(n_accepted + 1)
             self._evict_old_shadow(self._committed_length)
 
         self.stats.total_sync_latency_ms += (time.perf_counter() - sync_start) * 1000.0

@@ -11,7 +11,6 @@ import psutil
 import os
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Dict
-
 logger = logging.getLogger("AdaptiveSD.Monitor")
 
 @dataclass
@@ -87,6 +86,7 @@ class RuntimeMonitor:
         self._tps_ema = 0.0
 
         self._start_time = time.perf_counter()
+        self._generation_start_time: Optional[float] = None   # FIX: track generation start
         self._warmup_end = 20
         self._cooldown_start = 180
 
@@ -109,7 +109,9 @@ class RuntimeMonitor:
         logger.info("Baseline TPS set to %.2f", tps)
 
     def mark_generation_start(self):
-        self._start_time = time.perf_counter()
+        now = time.perf_counter()
+        self._start_time = now
+        self._generation_start_time = now   # FIX: separate tracker for overall_tps denominator
         self._first_token_time = None
         logger.info("Generation start time marked.")
 
@@ -327,16 +329,18 @@ class RuntimeMonitor:
     def get_evaluation_metrics(self) -> dict:
         current_tps = self.rolling_tps()
 
-        # FIX: Use total elapsed time (including prefill) for overall TPS
-        elapsed_total = time.perf_counter() - self._start_time
+        # FIX: use generation_start_time so overall_tps excludes model-load / baseline time
+        t_ref = self._generation_start_time if self._generation_start_time is not None else self._start_time
+        elapsed_total = time.perf_counter() - t_ref
         overall_tps = (self._total_tokens_committed / elapsed_total) if elapsed_total > 0 else 0.0
         
         has_speculation = self._total_drafted > 0
         avg_acceptance = (self._total_accepted / self._total_drafted) if has_speculation else 0.0
         
+        # FIX: speedup is None when no speculative path was active (not 1.0)
         speedup = (
-            current_tps / self._baseline_tps
-            if self._baseline_tps and self._baseline_tps > 0 else 1.0
+            overall_tps / self._baseline_tps
+            if self._baseline_tps and self._baseline_tps > 0 and has_speculation else None
         )
         avg_depth = (
             sum(s.speculation_depth for s in self._snapshots) / len(self._snapshots)
@@ -361,13 +365,21 @@ class RuntimeMonitor:
         peak_tps = max(self._tps_history) if self._tps_history else current_tps
         min_tps = min(self._tps_history) if self._tps_history else current_tps
 
+        # FIX: Correctly determine baseline source based on actual mode
+        if self._simulation_mode:
+            baseline_source = "estimated_from_model_size"
+        elif self._baseline_tps and self._baseline_tps > 0:
+            baseline_source = "measured_real_tps"
+        else:
+            baseline_source = "unknown"
+
         return {
             "current_tps": round(current_tps, 2),
             "overall_tps": round(overall_tps, 2),
             "baseline_tps": round(self._baseline_tps, 2) if self._baseline_tps else None,
             "peak_tps": round(peak_tps, 2),
             "min_tps": round(min_tps, 2),
-            "speedup_ratio": round(speedup, 3) if has_speculation else None,
+            "speedup_ratio": round(speedup, 3) if speedup is not None else None,
             "efficiency_gain": round(efficiency, 3) if has_speculation else None,
             "stability_cv": round(stability, 4),
             "total_tokens": self._total_tokens_committed,
@@ -394,7 +406,7 @@ class RuntimeMonitor:
                 "speculation_metrics_valid": has_speculation,
                 "sample_size_sufficient": sample_sufficient,
                 "sample_tokens": self._total_tokens_committed,
-                "baseline_source": "estimated_from_model_size",
+                "baseline_source": baseline_source,  # FIX: Now correctly reports source
             },
             "phase_breakdown": self.get_phase_breakdown(),
         }

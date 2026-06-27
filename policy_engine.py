@@ -365,7 +365,12 @@ class DynamicPolicyEngine:
 
     def get_workload_distribution(self) -> dict:
         total = sum(self._workload_history.values()) or 1
-        return {k: {"count": v, "percent": round(v / total * 100, 1)} for k, v in self._workload_history.items()}
+        # FIX: skip zero-count workloads to avoid cluttered output
+        return {
+            k: {"count": v, "percent": round(v / total * 100, 1)}
+            for k, v in self._workload_history.items()
+            if v > 0
+        }
 
     def get_policy_contribution(self) -> dict:
         if self.cfg.policy_type != PolicyType.ENSEMBLE:
