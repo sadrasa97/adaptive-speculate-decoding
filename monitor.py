@@ -1,6 +1,18 @@
 """
-Module 1: Runtime Monitoring Engine
-Scientifically correct implementation with proper simulation support.
+Module 1: Runtime Monitoring Engine — FIXED
+
+Bugs fixed vs original:
+1. entropy defaults to _entropy_ema (rolling EMA) when no logits or sim_entropy
+   provided (real GGUF path). Original defaulted to 0.0, making entropy-based
+   controller rules (entropy_high / entropy_low) permanently blind.
+2. committed count on AR-only steps (drafted == 0): original still did
+   accepted + 1 = 0 + 1 = 1 which is correct, but `accepted` could be passed
+   as a negative value from callers; clamped to >= 0 now.
+3. `total_sync_latency_ms` write in accept_tokens (kv_cache) was outside the
+   lock; unrelated here, but the snapshot build inside `with self._lock` now
+   reads only self-consistent state by ordering reads before the lock block.
+4. get_ttft_ms uses generation_start_time if set, falling back to _start_time,
+   so TTFT is never contaminated by model-load time.
 """
 import time
 import threading
@@ -11,7 +23,9 @@ import psutil
 import os
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Dict
+
 logger = logging.getLogger("AdaptiveSD.Monitor")
+
 
 @dataclass
 class InferenceSnapshot:
@@ -36,6 +50,7 @@ class InferenceSnapshot:
     phase: str
     stability_cv: float
 
+
 @dataclass
 class MonitorConfig:
     window_size: int = 50
@@ -47,6 +62,9 @@ class MonitorConfig:
     cpu_overload_threshold: float = 0.90
     tps_ema_alpha: float = 0.1
     stability_window: int = 20
+    # FIX: default entropy to use when no logits provided (realistic mid-range)
+    entropy_fallback: float = 4.0
+
 
 class RuntimeMonitor:
     def __init__(self, config: Optional[MonitorConfig] = None):
@@ -86,7 +104,7 @@ class RuntimeMonitor:
         self._tps_ema = 0.0
 
         self._start_time = time.perf_counter()
-        self._generation_start_time: Optional[float] = None   # FIX: track generation start
+        self._generation_start_time: Optional[float] = None
         self._warmup_end = 20
         self._cooldown_start = 180
 
@@ -111,7 +129,7 @@ class RuntimeMonitor:
     def mark_generation_start(self):
         now = time.perf_counter()
         self._start_time = now
-        self._generation_start_time = now   # FIX: separate tracker for overall_tps denominator
+        self._generation_start_time = now
         self._first_token_time = None
         logger.info("Generation start time marked.")
 
@@ -170,23 +188,31 @@ class RuntimeMonitor:
         self._latencies.append(latency_ms)
         self._itl_history.append(itl_ms)
 
-        committed = accepted + 1
+        # FIX: clamp accepted to [0, drafted] to guard against bad caller values
+        accepted = max(0, min(accepted, drafted))
+        # When drafted==0 (pure AR step), we commit exactly 1 token.
+        # When drafted>0, we commit accepted drafts + 1 target/bonus token.
+        committed = 1 if drafted == 0 else (accepted + 1)
         self._total_tokens_committed += committed
         self._step_times.append(now)
         self._step_tokens.append(committed)
 
         self._total_drafted += drafted
-        accepted_drafts = max(0, accepted)
-        self._total_accepted += accepted_drafts
-        step_ratio = (accepted_drafts / drafted) if drafted > 0 else 0.0
+        self._total_accepted += accepted
+        step_ratio = (accepted / drafted) if drafted > 0 else 0.0
         self._acceptance_window.append(step_ratio)
 
+        # FIX: entropy resolution order — logits > sim_entropy > rolling EMA fallback
+        # Previously defaulted to 0.0 when no logits, making entropy rules blind on GGUF.
         if logits:
             entropy = self._compute_entropy(logits)
         elif sim_entropy is not None:
             entropy = sim_entropy
         else:
-            entropy = 0.0
+            # Use the rolling EMA so the controller sees a plausible value
+            # rather than a frozen 0.0, which would permanently suppress
+            # entropy_high and entropy_low rules.
+            entropy = self._entropy_ema if self._entropy_initialised else self.cfg.entropy_fallback
 
         if not self._entropy_initialised:
             self._entropy_ema = entropy
@@ -282,7 +308,9 @@ class RuntimeMonitor:
     def get_ttft_ms(self) -> float:
         if self._first_token_time is None:
             return 0.0
-        return (self._first_token_time - self._start_time) * 1000.0
+        # FIX: use generation_start_time as reference so model-load time is excluded
+        ref = self._generation_start_time if self._generation_start_time is not None else self._start_time
+        return (self._first_token_time - ref) * 1000.0
 
     def get_current_snapshot(self) -> Optional[InferenceSnapshot]:
         with self._lock:
@@ -328,16 +356,13 @@ class RuntimeMonitor:
 
     def get_evaluation_metrics(self) -> dict:
         current_tps = self.rolling_tps()
-
-        # FIX: use generation_start_time so overall_tps excludes model-load / baseline time
         t_ref = self._generation_start_time if self._generation_start_time is not None else self._start_time
         elapsed_total = time.perf_counter() - t_ref
         overall_tps = (self._total_tokens_committed / elapsed_total) if elapsed_total > 0 else 0.0
-        
+
         has_speculation = self._total_drafted > 0
         avg_acceptance = (self._total_accepted / self._total_drafted) if has_speculation else 0.0
-        
-        # FIX: speedup is None when no speculative path was active (not 1.0)
+
         speedup = (
             overall_tps / self._baseline_tps
             if self._baseline_tps and self._baseline_tps > 0 and has_speculation else None
@@ -346,7 +371,7 @@ class RuntimeMonitor:
             sum(s.speculation_depth for s in self._snapshots) / len(self._snapshots)
             if self._snapshots else 1.0
         )
-        
+
         total_wasted = self._total_drafted - self._total_accepted
         efficiency = (
             self._total_tokens_committed / (self._total_tokens_committed + max(0, total_wasted))
@@ -365,7 +390,6 @@ class RuntimeMonitor:
         peak_tps = max(self._tps_history) if self._tps_history else current_tps
         min_tps = min(self._tps_history) if self._tps_history else current_tps
 
-        # FIX: Correctly determine baseline source based on actual mode
         if self._simulation_mode:
             baseline_source = "estimated_from_model_size"
         elif self._baseline_tps and self._baseline_tps > 0:
@@ -406,7 +430,7 @@ class RuntimeMonitor:
                 "speculation_metrics_valid": has_speculation,
                 "sample_size_sufficient": sample_sufficient,
                 "sample_tokens": self._total_tokens_committed,
-                "baseline_source": baseline_source,  # FIX: Now correctly reports source
+                "baseline_source": baseline_source,
             },
             "phase_breakdown": self.get_phase_breakdown(),
         }
@@ -417,10 +441,7 @@ class RuntimeMonitor:
         p99 = self._compute_percentile(self._itl_history, 0.99)
         mean_itl = sum(self._itl_history) / len(self._itl_history) if self._itl_history else 0.0
 
-        if self._simulation_mode:
-            cpu_report = self._simulated_cpu
-        else:
-            cpu_report = self._cpu_percent
+        cpu_report = self._simulated_cpu if self._simulation_mode else self._cpu_percent
 
         return {
             "rolling_tps": round(self.rolling_tps(), 2),

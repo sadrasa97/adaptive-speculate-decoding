@@ -44,7 +44,7 @@ class PolicyConfig:
     reward_acceptance_weight: float = 0.2
     reward_latency_weight: float = 0.3
     reward_cpu_weight: float = 0.1
-    depth_choices: List[int] = field(default_factory=lambda: [1, 2, 3, 4, 6, 8])
+    depth_choices: List[int] = field(default_factory=lambda: [1, 2, 3, 4])
     confidence_threshold: float = 0.6
     workload_change_hysteresis: int = 4
 

@@ -196,7 +196,10 @@ class AdaptiveDraftController:
                 if self._is_safe_suggestion(clamped, snap):
                     return self._adjust_depth(clamped, "policy_suggestion_accepted")
                 else:
-                    self._decision_counts["policy_suggestion_rejected"] = self._decision_counts.get("policy_suggestion_rejected", 0) + 1
+                    # Count rejection in decision stats (via _make_decision below)
+                    self._decision_counts["policy_suggestion_rejected"] = (
+                        self._decision_counts.get("policy_suggestion_rejected", 0) + 1
+                    )
         
         self._mode = self._depth_to_mode(self._depth)
         return self._make_decision(self._mode, self._depth, "steady_state")

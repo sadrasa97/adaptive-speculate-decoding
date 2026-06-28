@@ -21,21 +21,20 @@ from dotenv import load_dotenv
 def setup_logging(log_file: str = "adaptive_sd.log", verbose: bool = False):
     log_format = "%(asctime)s | %(name)-22s | %(levelname)-7s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
-    
     root_logger = logging.getLogger("AdaptiveSD")
     root_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     root_logger.handlers.clear()
-    
+
     fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(log_format, datefmt=date_format))
     root_logger.addHandler(fh)
-    
+
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(logging.Formatter(log_format, datefmt=date_format))
     root_logger.addHandler(ch)
-    
+
     return root_logger
 
 main_logger = logging.getLogger("AdaptiveSD.Main")
@@ -50,6 +49,7 @@ from monitor import RuntimeMonitor, MonitorConfig
 from draft_controller import AdaptiveDraftController, DraftControllerConfig, SpeculationMode
 from kv_cache import KVCacheCoordinator, KVCacheConfig
 from policy_engine import DynamicPolicyEngine, PolicyConfig, PolicyType
+from visualizer import RunRecord, generate_all_plots, plot_backend_comparison
 
 DEFAULT_MODEL = r"D:\models\Qwen3.5-2B-UD-Q4_K_XL.gguf"
 DEFAULT_DRAFT_MODEL = r"D:\models\Qwen3.5-0.8B-Q4_0.gguf"
@@ -119,19 +119,19 @@ def _sim_acceptance(step: int, depth: int, entropy: float, ctx_len: int) -> floa
         alpha_base = random.uniform(0.35, 0.50)
     else:
         alpha_base = random.uniform(0.18, 0.32)
-    
+
     depth_decay = math.exp(-0.18 * max(0, depth - 1))
     entropy_factor = 1.0 / (1.0 + 0.07 * max(0.0, entropy - 5.0))
     ctx_factor = max(0.75, 1.0 - 8e-5 * ctx_len)
-    
+
     raw = alpha_base * depth_decay * entropy_factor * ctx_factor
     raw += random.gauss(0.0, 0.015)
-    
+
     if step % 50 == 0:
         print(f"\n[DIAG] step={step:4d} | α_base={alpha_base:.3f} | δ(D={depth})={depth_decay:.3f} | "
               f"φ(H={entropy:.2f})={entropy_factor:.3f} | ψ(L={ctx_len})={ctx_factor:.3f} | "
               f"α_raw={raw:.3f}", flush=True)
-    
+
     return max(0.05, min(0.92, raw))
 
 def _sim_entropy(step: int, workload: str) -> float:
@@ -141,7 +141,6 @@ def _sim_entropy(step: int, workload: str) -> float:
         base = random.uniform(5.5, 7.5)
     else:
         base = random.uniform(6.0, 8.0)
-    
     offsets = {
         "coding": -1.2,
         "chat": -0.4,
@@ -161,6 +160,7 @@ def _sim_cpu(step: int, depth: int, acceptance_ratio: float, workload: str) -> f
     noise = random.gauss(0.0, 0.015)
     cpu = c_target + c_draft + c_reject + c_workload + noise
     return max(0.05, min(0.97, cpu))
+
 
 class AdaptiveInferenceEngine:
     def __init__(self, model_path=DEFAULT_MODEL, draft_model_path=DEFAULT_DRAFT_MODEL,
@@ -184,9 +184,8 @@ class AdaptiveInferenceEngine:
             window_size=64, acceptance_low_threshold=0.40, cpu_overload_threshold=0.88,
         )
         
-        # FIX: Optimized for CPU-constrained environments
         self._controller_cfg = DraftControllerConfig(
-            min_depth=1, max_depth=4, initial_depth=min(n_draft, 2),
+            min_depth=1, max_depth=2, initial_depth=min(n_draft, 2),
             acceptance_low=0.25, acceptance_disable=0.05,
             bad_steps_to_disable=10,
             depth_change_cooldown=5, oscillation_window=10, oscillation_threshold=3,
@@ -206,11 +205,19 @@ class AdaptiveInferenceEngine:
         self.kv = KVCacheCoordinator(self._kv_cfg)
         self.policy = DynamicPolicyEngine(monitor=self.monitor, controller=self.controller, config=self._policy_cfg)
         
+        self._ts_tps: List[float] = []
+        self._ts_acceptance: List[float] = []
+        self._ts_depth: List[int] = []
+        self._ts_itl: List[float] = []
+        self._ts_cpu: List[float] = []
+        self._ts_entropy: List[float] = []
+        
         self._llm = None
         self._draft_llm = None
         self._active_backend = "simulation"
         self._n_threads = n_threads if n_threads > 0 else max(1, (os.cpu_count() or 2) // 2)
         self._baseline_tps = None
+        self._last_run_records = []
         
         self._resolve_backend()
         self._load_model_if_needed()
@@ -220,9 +227,8 @@ class AdaptiveInferenceEngine:
             "Engine initialised: backend=%s, model=%s, baseline_tps=%.1f, threads=%d",
             self._active_backend, model_path, self._baseline_tps, self._n_threads
         )
-    
+
     def _measure_baseline_tps(self):
-        """Measure real baseline TPS by running inference without speculation"""
         if self._active_backend == "simulation":
             self._baseline_tps = 12.0
             self.monitor.set_baseline_tps(self._baseline_tps)
@@ -277,20 +283,18 @@ class AdaptiveInferenceEngine:
             return
         
         if self._llm is None:
-            self._baseline_tps = 12.0
+            self._baseline_tps = 12.0 
             self.monitor.set_baseline_tps(self._baseline_tps)
             return
         
         main_logger.info("Measuring baseline TPS (no speculation)...")
         
-        # Warmup
         test_prompt = "The quick brown fox jumps over the lazy dog."
         try:
             _ = self._llm(test_prompt, max_tokens=10, temperature=0.7, echo=False)
         except Exception as e:
             main_logger.warning("Warmup failed: %s", e)
         
-        # Measure
         test_tokens = 100
         t0 = time.perf_counter()
         try:
@@ -311,7 +315,7 @@ class AdaptiveInferenceEngine:
             self._baseline_tps = 12.0
         
         self.monitor.set_baseline_tps(self._baseline_tps)
-    
+
     def _reset_runtime_modules(self):
         try:
             self.monitor.stop()
@@ -323,7 +327,14 @@ class AdaptiveInferenceEngine:
         self.controller = AdaptiveDraftController(monitor=self.monitor, config=self._controller_cfg)
         self.kv = KVCacheCoordinator(self._kv_cfg)
         self.policy = DynamicPolicyEngine(monitor=self.monitor, controller=self.controller, config=self._policy_cfg)
-    
+        
+        self._ts_tps = []
+        self._ts_acceptance = []
+        self._ts_depth = []
+        self._ts_itl = []
+        self._ts_cpu = []
+        self._ts_entropy = []
+
     def _resolve_backend(self):
         gguf_ready = LLAMA_AVAILABLE and os.path.exists(self.model_path)
         or_ready = bool(self.openrouter_api_key)
@@ -353,7 +364,7 @@ class AdaptiveInferenceEngine:
             self._active_backend = "openrouter"
         else:
             self._active_backend = "simulation"
-    
+
     def _load_model_if_needed(self):
         if self._active_backend not in ["gguf", "openrouter"]:
             return
@@ -378,7 +389,6 @@ class AdaptiveInferenceEngine:
             n_threads=self._n_threads,
             n_batch=512,
             verbose=self.verbose,
-            logits_all=True  # ← این خط ضروری است برای logprobs
         )
         
         if os.path.exists(self.draft_model_path):
@@ -390,7 +400,6 @@ class AdaptiveInferenceEngine:
                     n_threads=self._n_threads,
                     n_batch=512,
                     verbose=self.verbose,
-                    logits_all=True
                 )
                 main_logger.info("Draft model loaded successfully. Speculative decoding enabled.")
             except Exception as e:
@@ -398,15 +407,11 @@ class AdaptiveInferenceEngine:
                 self._draft_llm = None
         else:
             main_logger.warning(
-                "Draft model not found at %s. Speculative decoding disabled.\n"
-                "To enable speculative decoding:\n"
-                "  1. Download a draft model (e.g., Qwen3.5-0.5B-UD-Q4_K_XL.gguf)\n"
-                "  2. Place it at: %s\n"
-                "  3. Or specify path with --draft-model argument",
-                self.draft_model_path, self.draft_model_path
+                "Draft model not found at %s. Speculative decoding disabled.",
+                self.draft_model_path
             )
             self._draft_llm = None
-    
+
     def generate(self, prompt: str, max_tokens=256, temperature=0.7, top_p=0.9, stream=True) -> str:
         self.monitor.mark_generation_start()
         
@@ -423,282 +428,247 @@ class AdaptiveInferenceEngine:
         
         self.monitor.set_simulation_mode(True)
         return self._generate_simulated(prompt, max_tokens, stream)
-    
+
     def _generate_speculative(self, prompt, max_tokens, temperature, top_p, stream) -> str:
-        """
-        Speculative decoding with llama-cpp-python.
-        """
         output: List[str] = []
         safety_prefix = (
             "You are a concise assistant.\n"
             "Provide only the final answer and do not reveal internal reasoning.\n\n"
         )
         wrapped_prompt = f"{safety_prefix}User: {prompt}\nAssistant: "
-        
         prompt_tokens: List[int] = self._llm.tokenize(wrapped_prompt.encode())
-        
+
         if stream:
             print("", end="", flush=True)
-        
+
         total_generated = 0
         step_count = 0
-        consecutive_failures = 0
+        api_failures = 0
         
+        # FIX: نگهداری رشته کامل برای پاس دادن به Llama (جلوگیری از خطای List[int])
+        current_text = wrapped_prompt
+
         self.policy.step("", prompt=prompt)
-        
+
         while total_generated < max_tokens:
             step_start = time.perf_counter()
             step_count += 1
-            
-            # FIX: Fallback to non-speculative if too many failures
-            if consecutive_failures >= 5:
-                main_logger.warning("Too many speculative failures, falling back to non-speculative")
+
+            if api_failures >= 5:
+                main_logger.warning("Too many API failures, falling back to non-speculative")
                 remaining_text = self._generate_real(
-                    wrapped_prompt + "".join(output),
-                    max_tokens - total_generated,
-                    temperature, top_p, stream
+                    current_text, max_tokens - total_generated, temperature, top_p, stream,
                 )
                 output.append(remaining_text)
                 break
-            
+
             depth = self.controller.current_depth()
             remaining = max_tokens - total_generated
             actual_depth = min(depth, remaining)
-            
-            # Step 1: Draft model proposes tokens
+
+            # ═══════════════════════════════════════════════════════════════
+            # PHASE A: Draft — تولید توکن با Draft Model
+            # ═══════════════════════════════════════════════════════════════
+            draft_ids: List[int] = []
             draft_texts: List[str] = []
-            draft_token_ids: List[int] = []
-            draft_ctx = list(prompt_tokens)
-            
+            draft_text = current_text
+
             for _ in range(actual_depth):
                 try:
                     d_out = self._draft_llm(
-                        draft_ctx,
-                        max_tokens=1,
-                        temperature=temperature,
-                        top_p=top_p,
-                        echo=False,
+                        draft_text, max_tokens=1, temperature=temperature, top_p=top_p, echo=False,
                     )
                     if not (isinstance(d_out, dict) and d_out.get("choices")):
                         break
                     tok_text = d_out["choices"][0].get("text", "")
-                    if not tok_text:
-                        break
+                    if not tok_text: break   # EOS
+                    
                     toks = self._draft_llm.tokenize(tok_text.encode())
-                    if not toks:
-                        break
-                    tok_id = toks[0]
-                    draft_token_ids.append(tok_id)
+                    if not toks: break
+                    
+                    draft_ids.append(toks[0])
                     draft_texts.append(tok_text)
-                    draft_ctx.append(tok_id)
+                    draft_text += tok_text   # FIX: الحاق رشته بدون Space اضافی
                 except Exception as e:
-                    main_logger.debug("Draft token failed: %s", e)
+                    main_logger.warning("Draft token exception: %s", e)
+                    api_failures += 1
                     break
-            
-            # Step 2: Target model verifies
-            accepted_count = 0
-            target_tok_id: Optional[int] = None
-            target_tok_text: str = ""
-            target_logits_last: List[float] = []
-            
-            verify_ctx = list(prompt_tokens)
-            for i, dtok in enumerate(draft_token_ids):
+
+            # ═══════════════════════════════════════════════════════════════
+            # PHASE B: Verify — تایید با Target Model
+            # ═══════════════════════════════════════════════════════════════
+            accepted = 0
+            correction_id: Optional[int] = None
+            correction_text: str = ""
+            verify_text = current_text
+            eos_hit = False
+
+            for i, did in enumerate(draft_ids):
                 try:
                     t_out = self._llm(
-                        verify_ctx,
-                        max_tokens=1,
-                        temperature=0.0,  # FIX: Use greedy for verification
-                        top_p=1.0,
-                        echo=False,
-                        logprobs=20,
+                        verify_text, max_tokens=1, temperature=0.7, 
+                        top_p=1.0, echo=False,
                     )
-                    if not (isinstance(t_out, dict) and t_out.get("choices")):
-                        break
-                    choice = t_out["choices"][0]
-                    t_text = choice.get("text", "")
-                    t_toks = self._llm.tokenize(t_text.encode()) if t_text else []
-                    
-                    vlogprobs = choice.get("logprobs") or {}
-                    top_lps = vlogprobs.get("top_logprobs") or []
-                    if top_lps:
-                        target_logits_last = list((top_lps[-1] or {}).values())
-                    
-                    if not t_toks:
-                        target_tok_id = None
-                        target_tok_text = t_text
-                        break
-                    
-                    target_next_id = t_toks[0]
-                    
-                    # FIX: Compare token IDs directly
-                    if target_next_id == dtok:
-                        accepted_count += 1
-                        verify_ctx.append(dtok)
-                        target_tok_id = None
-                        target_tok_text = ""
-                    else:
-                        target_tok_id = target_next_id
-                        target_tok_text = t_text
-                        break
                 except Exception as e:
-                    main_logger.debug("Verify step %d failed: %s", i, e)
-                    consecutive_failures += 1
+                    main_logger.warning("Verify exception at step %d: %s", i, e)
+                    api_failures += 1
                     break
-            
-            # Bonus token if all drafts accepted
-            if accepted_count == len(draft_token_ids) and target_tok_id is None and draft_token_ids:
+
+                if not (isinstance(t_out, dict) and t_out.get("choices")):
+                    api_failures += 1
+                    break
+
+                choice = t_out["choices"][0]
+                t_text = choice.get("text", "")
+                t_toks = self._llm.tokenize(t_text.encode()) if t_text else []
+
+                if not t_toks:
+                    eos_hit = True
+                    break
+
+                if t_toks[0] == did:
+                    accepted += 1
+                    verify_text += t_text # FIX: الحاق رشته برای KV Reuse صحیح
+                else:
+                    correction_id = t_toks[0]
+                    correction_text = t_text
+                    break
+
+            # ─── Bonus token اگر همه draft قبول شدند ─────────────────────
+            if accepted == len(draft_ids) and draft_ids and not eos_hit:
                 try:
-                    bonus_ctx = list(prompt_tokens) + draft_token_ids
-                    b_out = self._llm(
-                        bonus_ctx,
-                        max_tokens=1,
-                        temperature=0.0,
-                        top_p=1.0,
-                        echo=False,
-                        logprobs=20,
-                    )
+                    b_out = self._llm(verify_text, max_tokens=1, temperature=0.7, top_p=1.0, echo=False)
                     if isinstance(b_out, dict) and b_out.get("choices"):
                         choice = b_out["choices"][0]
-                        target_tok_text = choice.get("text", "")
-                        b_toks = self._llm.tokenize(target_tok_text.encode()) if target_tok_text else []
-                        target_tok_id = b_toks[0] if b_toks else None
-                        vlogprobs = choice.get("logprobs") or {}
-                        top_lps = vlogprobs.get("top_logprobs") or []
-                        if top_lps:
-                            target_logits_last = list((top_lps[-1] or {}).values())
+                        correction_text = choice.get("text", "")
+                        b_toks = self._llm.tokenize(correction_text.encode()) if correction_text else []
+                        correction_id = b_toks[0] if b_toks else None
+                        if not b_toks: eos_hit = True
                 except Exception as e:
-                    main_logger.debug("Bonus token failed: %s", e)
-            
-            # AR fallback if no drafts and no target token
-            if not draft_token_ids and target_tok_id is None:
+                    main_logger.warning("Bonus token exception: %s", e)
+
+            # ─── AR fallback اگر draft خالی بود ──────────────────────────
+            if not draft_ids and not eos_hit:
                 try:
-                    ar_out = self._llm(
-                        list(prompt_tokens),
-                        max_tokens=1,
-                        temperature=0.0,
-                        top_p=1.0,
-                        echo=False,
-                        logprobs=20,
-                    )
+                    ar_out = self._llm(current_text, max_tokens=1, temperature=temperature, top_p=top_p, echo=False)
                     if isinstance(ar_out, dict) and ar_out.get("choices"):
                         choice = ar_out["choices"][0]
-                        target_tok_text = choice.get("text", "")
-                        ar_toks = self._llm.tokenize(target_tok_text.encode()) if target_tok_text else []
-                        target_tok_id = ar_toks[0] if ar_toks else None
-                        vlogprobs = choice.get("logprobs") or {}
-                        top_lps = vlogprobs.get("top_logprobs") or []
-                        if top_lps:
-                            target_logits_last = list((top_lps[-1] or {}).values())
+                        correction_text = choice.get("text", "")
+                        ar_toks = self._llm.tokenize(correction_text.encode()) if correction_text else []
+                        correction_id = ar_toks[0] if ar_toks else None
+                        if not ar_toks: eos_hit = True
+                    else:
+                        api_failures += 1
                 except Exception as e:
-                    main_logger.debug("AR fallback failed: %s", e)
-            
-            # KV bookkeeping
+                    main_logger.warning("AR fallback exception: %s", e)
+                    api_failures += 1
+
+            # ═══════════════════════════════════════════════════════════════
+            # KV bookkeeping (منطق Shadow Buffer ماژول KV Cache)
+            # ═══════════════════════════════════════════════════════════════
             committed_pos = len(prompt_tokens)
             self.kv.begin_draft(actual_depth, committed_pos)
-            dummy_keys = np.zeros((1, 1, 64), dtype=np.float32)
-            dummy_vals = np.zeros((1, 1, 64), dtype=np.float32)
+            dummy_k = np.zeros((1, 1, 64), dtype=np.float32)
+            dummy_v = np.zeros((1, 1, 64), dtype=np.float32)
             for i in range(actual_depth):
-                self.kv.store_draft_kv(committed_pos + i, dummy_keys, dummy_vals)
-            for i in range(accepted_count):
+                self.kv.store_draft_kv(committed_pos + i, dummy_k, dummy_v)
+            for i in range(accepted):
                 self.kv.retrieve_draft_kv(committed_pos + i)
-            self.kv.accept_tokens(accepted_count)
-            n_rejected = actual_depth - accepted_count
-            if n_rejected > 0:
-                self.kv.reject_tokens(n_rejected)
-            
+            self.kv.accept_tokens(accepted)
+            n_rej = actual_depth - accepted
+            if n_rej > 0:
+                self.kv.reject_tokens(n_rej)
+
+            # ═══════════════════════════════════════════════════════════════
             # Build committed sequence
-            committed_ids: List[int] = draft_token_ids[:accepted_count]
-            if target_tok_id is not None:
-                committed_ids.append(target_tok_id)
-            
-            committed_texts: List[str] = draft_texts[:accepted_count]
-            if target_tok_text:
-                committed_texts.append(target_tok_text)
-            
+            # ═══════════════════════════════════════════════════════════════
+            committed_ids: List[int] = draft_ids[:accepted]
+            committed_texts: List[str] = draft_texts[:accepted]
+            if correction_id is not None:
+                committed_ids.append(correction_id)
+                committed_texts.append(correction_text)
+
+            # FIX: استفاده از "".join به جای " ".join برای جلوگیری از Tokenization Drift
             generated_text = "".join(committed_texts)
             output.append(generated_text)
-            
+            current_text += generated_text
             prompt_tokens.extend(committed_ids)
-            
+
             tokens_this_step = max(1, len(committed_ids))
             tokens_this_step = min(tokens_this_step, remaining)
             total_generated += tokens_this_step
-            
-            # Monitor
+
+            real_committed = len(committed_ids)
             snap = self.monitor.on_token_generated(
-                logits=target_logits_last if target_logits_last else None,
+                logits=None,  # FIX: تکیه بر EMA Fallback ماژول Monitor به جای logprobs که کرش می‌کرد
                 drafted=actual_depth,
-                accepted=accepted_count,
+                accepted=max(0, real_committed - 1),
                 context_length=len(prompt_tokens),
                 speculation_depth=actual_depth,
             )
-            
-            # Policy + controller
+
+            self._ts_tps.append(snap.tokens_per_sec)
+            self._ts_acceptance.append(snap.acceptance_ratio)
+            self._ts_depth.append(actual_depth)
+            self._ts_itl.append(snap.itl_ms)
+            self._ts_cpu.append(snap.cpu_utilization)
+            self._ts_entropy.append(snap.token_entropy)
+
             policy_suggestion, policy_confidence = self.policy.step(generated_text)
             decision = self.controller.step(
-                snap,
-                policy_suggestion=policy_suggestion,
-                policy_confidence=policy_confidence,
+                snap, policy_suggestion=policy_suggestion, policy_confidence=policy_confidence,
             )
-            
+
             if stream and generated_text:
                 print(generated_text, end="", flush=True)
-            
+
             step_elapsed = time.perf_counter() - step_start
-            
-            # FIX: Reset failure counter on success
-            if accepted_count > 0:
-                consecutive_failures = 0
-            
+
+            if committed_ids:
+                api_failures = 0
+
             if step_count % 25 == 0 or total_generated >= max_tokens:
                 self._print_status(total_generated, decision)
                 print(
                     f"[DBG] step={step_count:4d} | depth={actual_depth} | "
-                    f"accepted={accepted_count}/{actual_depth} | "
+                    f"accepted={accepted}/{actual_depth} | "
                     f"committed={tokens_this_step} | t_step={step_elapsed*1000:.1f}ms",
                     flush=True,
                 )
-            
-            # EOS guard
-            if target_tok_id is None and not draft_token_ids:
-                main_logger.debug("EOS reached at step %d", step_count)
+
+            if eos_hit and correction_id is None:
+                main_logger.debug("EOS at step %d", step_count)
                 break
-        
+
         if stream:
             print()
-        
-        return "".join(output)
-    
+
+        return "".join(output) # FIX: الحاق نهایی بدون Space
+
     def _generate_real(self, prompt, max_tokens, temperature, top_p, stream) -> str:
         output = []
         safety_prefix = (
             "You are a concise assistant.\n"
             "Provide only the final answer and do not reveal internal reasoning.\n\n"
         )
-        wrapped_prompt = f"{safety_prefix}User: {prompt}\nAssistant: "
+        # FIX: اگر prompt از قبل Wrapper شده بود (در fallback)، دیگر Wrapper نکنیم
+        if prompt.startswith(safety_prefix):
+            wrapped_prompt = prompt
+        else:
+            wrapped_prompt = f"{safety_prefix}User: {prompt}\nAssistant: "
+            
         ctx = len(self._llm.tokenize(wrapped_prompt.encode()))
 
-        # ❌ حذف logprobs از اینجا — چون نیازی نیست
         generator = self._llm(
-            wrapped_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stream=True,
-            # logprobs=10,  ← حذف شود
+            wrapped_prompt, max_tokens=max_tokens, temperature=temperature, top_p=top_p, stream=True,
         )
         
         for td in generator:
             tok = td["choices"][0]["text"]
             output.append(tok)
             ctx += 1
-            # ❌ بدون logprobs، نمی‌توانیم entropy بفرستیم — پس None بفرستیم
             self.monitor.on_token_generated(
-                logits=None,  # ← None بفرستیم
-                drafted=0,
-                accepted=0,
-                context_length=ctx,
-                speculation_depth=1,
+                logits=None, drafted=0, accepted=0, context_length=ctx, speculation_depth=1,
             )
             if stream:
                 print(tok, end="", flush=True)
@@ -706,11 +676,9 @@ class AdaptiveInferenceEngine:
         if stream:
             print()
             
-        return "".join(output)
-        
+        return "".join(output) # FIX: الحاق بدون Space
 
     def _generate_openrouter(self, prompt, max_tokens, temperature, top_p, stream) -> str:
-        """OpenRouter API inference with retry logic."""
         headers = {
             "Authorization": f"Bearer {self.openrouter_api_key}",
             "Content-Type": "application/json",
@@ -722,7 +690,6 @@ class AdaptiveInferenceEngine:
         
         max_retries = 3
         content = None
-        elapsed = 0.0
         
         for attempt in range(max_retries):
             payload = {
@@ -751,7 +718,6 @@ class AdaptiveInferenceEngine:
                 t0 = time.perf_counter()
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     body = resp.read().decode("utf-8")
-                elapsed = time.perf_counter() - t0
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
                 raise RuntimeError(f"OpenRouter HTTP error: {e.code} {detail}") from e
@@ -771,8 +737,6 @@ class AdaptiveInferenceEngine:
             
             choices = data.get("choices", [])
             if not choices:
-                main_logger.warning("OpenRouter returned no choices (attempt %d/%d)",
-                                attempt + 1, max_retries)
                 if attempt < max_retries - 1:
                     time.sleep(2)
                     continue
@@ -782,19 +746,13 @@ class AdaptiveInferenceEngine:
             message = choices[0].get("message") or {}
             content = message.get("content") or ""
             reasoning = message.get("reasoning") or ""
-            finish_reason = choices[0].get("finish_reason", "")
             
             if not content and reasoning:
-                main_logger.info("Using reasoning field as content (finish_reason=%s)", finish_reason)
                 content = reasoning
                 break
             elif content and len(content.strip()) > 10:
                 break
             else:
-                main_logger.warning(
-                    "OpenRouter returned short/empty content (attempt %d/%d, finish_reason=%s, len=%d)",
-                    attempt + 1, max_retries, finish_reason, len(content)
-                )
                 if attempt < max_retries - 1:
                     time.sleep(2)
                     continue
@@ -806,7 +764,6 @@ class AdaptiveInferenceEngine:
         
         context_len = 20 + len(prompt.split())
         words = content.split()
-        n_words = len(words)
         
         if stream:
             print("", end="", flush=True)
@@ -833,7 +790,7 @@ class AdaptiveInferenceEngine:
             print()
         
         return content
-    
+
     def _generate_simulated(self, prompt: str, max_tokens: int, stream: bool) -> str:
         corpus_name = _select_corpus(prompt)
         corpus = _SIM_CORPORA[corpus_name]
@@ -874,7 +831,7 @@ class AdaptiveInferenceEngine:
             ctx_now = context_len + total_committed
             per_tok_alpha = _sim_acceptance(step_count, depth, sim_entropy, ctx_now)
             
-            accepted_drafts = max(0, round(depth * per_tok_alpha))
+            accepted_drafts = max(0, min(depth, round(depth * per_tok_alpha)))
             tokens_this_step = min(accepted_drafts + 1, max_tokens - total_committed)
             n_rejected = depth - accepted_drafts
             
@@ -897,11 +854,18 @@ class AdaptiveInferenceEngine:
                 simulated_cpu=sim_cpu,
             )
             
+            self._ts_tps.append(snap.tokens_per_sec)
+            self._ts_acceptance.append(snap.acceptance_ratio)
+            self._ts_depth.append(depth)
+            self._ts_itl.append(snap.itl_ms)
+            self._ts_cpu.append(sim_cpu)
+            self._ts_entropy.append(sim_entropy)
+            
+            # FIX: استفاده از "".join برای شبیه‌ساز
             generated_text = "".join(all_tokens[token_idx: token_idx + tokens_this_step])
             policy_suggestion, policy_confidence = self.policy.step(generated_text)
             decision = self.controller.step(
-                snap, policy_suggestion=policy_suggestion,
-                policy_confidence=policy_confidence,
+                snap, policy_suggestion=policy_suggestion, policy_confidence=policy_confidence,
             )
             
             committed_pos = ctx_now
@@ -940,8 +904,8 @@ class AdaptiveInferenceEngine:
                       flush=True)
         
         print("\n")
-        return "".join(all_tokens[:total_committed])
-    
+        return "".join(all_tokens[:total_committed]) # FIX: الحاق نهایی
+
     def _print_status(self, step: int, decision):
         mon = self.monitor.summary()
         ctrl = self.controller.summary()
@@ -950,20 +914,20 @@ class AdaptiveInferenceEngine:
         ev = self.monitor.get_evaluation_metrics()
         
         print(f"\n{'─' * 70}")
-        print(f"  Tokens {step:>4d} │ Mode: {ctrl['mode']:12s} │ Depth: {ctrl['draft_depth']} │ Reason: {decision.reason}")
-        print(f"  TPS: {mon['rolling_tps']:>6.1f} (EMA: {mon['ema_tps']:.1f}) │      "
+        print(f"  Tokens {step: >4d} │ Mode: {ctrl['mode']:12s} │ Depth: {ctrl['draft_depth']} │ Reason: {decision.reason}")
+        print(f"  TPS: {mon['rolling_tps']: >6.1f} (EMA: {mon['ema_tps']:.1f}) │       "
               f"Acceptance: {mon['rolling_acceptance']:.1%} │   CPU: {mon['cpu_utilization']:.1%} │   Phase: {mon['phase']}")
-        print(f"  ITL: {mon['mean_itl_ms']:>6.2f} ms │      "
+        print(f"  ITL: {mon['mean_itl_ms']: >6.2f} ms │       "
               f"P95: {mon['p95_itl_ms']:.2f} ms │   P99: {mon['p99_itl_ms']:.2f} ms │   Stability: {mon['stability_cv']:.3f}")
         spec_eff = ev.get('speculative_efficiency')
         spec_eff_str = f"{spec_eff:.3f}" if spec_eff is not None else "N/A"
-        print(f"  Entropy: {mon['entropy_ema']:.3f} │      "
+        print(f"  Entropy: {mon['entropy_ema']:.3f} │       "
               f"Workload: {pol['workload']:10s} │   Policy: {pol['policy_type']} │   Efficiency: {spec_eff_str}")
-        print(f"  KV syncs: {kv['total_syncs']} │      "
-              f"Rollbacks: {kv['total_rollbacks']} (p:{kv['partial_rollbacks']}, f:{kv['full_rollbacks']}) │      "
+        print(f"  KV syncs: {kv['total_syncs']} │       "
+              f"Rollbacks: {kv['total_rollbacks']} (p:{kv['partial_rollbacks']}, f:{kv['full_rollbacks']}) │       "
               f"Hit Rate: {kv['hit_rate']:.1%} │   Pressure: {kv['memory_pressure']:.1%}")
         print(f"{'─' * 70}\n", end="", flush=True)
-    
+
     def _print_final_evaluation(self):
         ev = self.monitor.get_evaluation_metrics()
         cs = self.controller.get_decision_stats()
@@ -972,14 +936,14 @@ class AdaptiveInferenceEngine:
         kv = self.kv.get_stats()
         ps = self.policy.summary()
         
-        print("\n" + "─" * 70)
+        print("\n" + "─ " * 70)
         print("  DIAGNOSTIC SANITY CHECKS")
-        print("─" * 70)
+        print("─ " * 70)
         total_committed = ev['total_tokens']
         total_drafted = ev['total_drafted']
         total_accepted = ev['total_accepted']
         total_steps = ev['total_steps']
-        avg_acc = ev['avg_acceptance']
+        avg_acc =  ev['avg_acceptance']
         speedup = ev['speedup_ratio']
         theoretical_max = (1 + avg_acc * ev['avg_depth'])
         has_speculation = total_drafted > 0
@@ -996,14 +960,14 @@ class AdaptiveInferenceEngine:
             print(f"  [CHECK] speedup ratio      = {speedup:.3f}x  (>1.0 means faster than baseline)")
         else:
             print("  [CHECK] speedup ratio      = N/A (no speculative path active)")
-        print(f"  [CHECK] theoretical max tps ≈ {self.monitor._baseline_tps * theoretical_max:.1f}     "
+        print(f"  [CHECK] theoretical max tps ≈ {self.monitor._baseline_tps * theoretical_max:.1f}      "
               f"(baseline × E[tokens/step])")
         if has_speculation:
             print(f"  [CHECK] KV hit rate        = {kv['hit_rate']:.1%}  (should be > 0% with store-then-retrieve)")
         else:
             print("  [CHECK] KV hit rate        = N/A (KV draft path not used)")
         print(f"  [CHECK] total drafted      = {total_drafted}  | total wasted = {ev['total_wasted']}")
-        print(f"  [CHECK] sample size        = {ev['total_tokens']} tokens   "
+        print(f"  [CHECK] sample size        = {ev['total_tokens']} tokens    "
               f"({'sufficient' if ev.get('sample_sufficient') else 'small sample; interpret cautiously'})")
         
         if has_speculation:
@@ -1019,7 +983,7 @@ class AdaptiveInferenceEngine:
             print(f"  [{'✓ ALL OK' if ok else '✗ ISSUES FOUND'}]")
         else:
             print("  [INFO] Non-speculative run: speculative checks intentionally skipped")
-        print("─" * 70)
+        print("─ " * 70)
         
         print("\n" + "=" * 70)
         print("  COMPREHENSIVE EVALUATION METRICS")
@@ -1118,8 +1082,8 @@ class AdaptiveInferenceEngine:
         
         print("\n" + "=" * 70)
         main_logger.info("Final evaluation: %s", json.dumps(ev, indent=2))
-    
-    def benchmark(self, prompts=None, tokens_each=100):
+
+    def benchmark(self, prompts=None, tokens_each=100, plot_dir: str = "plots"):
         if prompts is None:
             prompts = [
                 "Write a Python implementation of quicksort.",
@@ -1130,6 +1094,7 @@ class AdaptiveInferenceEngine:
         print("  BENCHMARK")
         print("=" * 70)
         results = []
+        run_records: List[RunRecord] = []
         for idx, prompt in enumerate(prompts):
             self._reset_runtime_modules()
             print(f"\n[{idx + 1}/{len(prompts)}] {prompt[:60]}...")
@@ -1137,14 +1102,60 @@ class AdaptiveInferenceEngine:
             self.generate(prompt, max_tokens=tokens_each, stream=False)
             elapsed = time.perf_counter() - t0
             ev = self.monitor.get_evaluation_metrics()
+            cs = self.controller.get_decision_stats()
+            cst = self.controller.get_stability_metrics()
+            wd = self.policy.get_workload_distribution()
+            ps = self.policy.summary()
+            kv = self.kv.get_stats()
             speedup_brief = f"{ev['speedup_ratio']:.2f}x" if ev['speedup_ratio'] is not None else "N/A"
             print(f"    {elapsed:.2f}s | TPS: {ev['overall_tps']:.1f} | Speedup: {speedup_brief} | Acc: {ev['avg_acceptance']:.1%}")
             results.append({"prompt": prompt[:40], "elapsed": round(elapsed, 2), **ev})
+            
+            run_records.append(RunRecord(
+                prompt_short=prompt[:55],
+                elapsed_s=elapsed,
+                overall_tps=ev["overall_tps"],
+                speedup_ratio=ev["speedup_ratio"],
+                avg_acceptance=ev["avg_acceptance"],
+                avg_depth=ev["avg_depth"],
+                mean_itl_ms=ev["mean_itl_ms"],
+                p95_itl_ms=ev["p95_itl_ms"],
+                p99_itl_ms=ev["p99_itl_ms"],
+                speculative_efficiency=ev.get("speculative_efficiency"),
+                total_tokens=ev["total_tokens"],
+                total_drafted=ev["total_drafted"],
+                total_accepted=ev["total_accepted"],
+                total_wasted=ev["total_wasted"],
+                baseline_tps=ev["baseline_tps"],
+                peak_tps=ev["peak_tps"],
+                min_tps=ev["min_tps"],
+                stability_cv=ev["stability_cv"],
+                ttft_ms=ev["ttft_ms"],
+                phase_breakdown=ev.get("phase_breakdown", {}),
+                decision_stats=cs,
+                stability_metrics=cst,
+                workload_distribution=wd,
+                policy_summary=ps,
+                kv_stats=kv,
+                tps_series=list(self._ts_tps),
+                acceptance_series=list(self._ts_acceptance),
+                depth_series=list(self._ts_depth),
+                itl_series=list(self._ts_itl),
+                cpu_series=list(self._ts_cpu),
+                entropy_series=list(self._ts_entropy),
+            ))
+
         self._print_benchmark_summary(results)
-        
         self._print_final_evaluation()
+
+        backend_tag = f"_{self._active_backend}"
+        saved_plots = generate_all_plots(run_records, plot_dir, tag=backend_tag)
+        if saved_plots:
+            print(f"\n  ✓ {len(saved_plots)} visualisation plot(s) saved to: {os.path.abspath(plot_dir)}")
+
+        self._last_run_records = run_records
         return results
-    
+
     def _print_benchmark_summary(self, results: List[dict]):
         if not results:
             return
@@ -1174,11 +1185,11 @@ class AdaptiveInferenceEngine:
         else:
             print("  Mean Speculative Speedup: N/A (no speculative runs)")
         print("-" * 70)
-    
+
     def close(self):
         self.monitor.stop()
         main_logger.info("Engine closed.")
-    
+
     def status_json(self) -> str:
         return json.dumps({
             "monitor": self.monitor.summary(),
@@ -1190,7 +1201,6 @@ class AdaptiveInferenceEngine:
         }, indent=2)
 
 def _redact_args(args_dict: dict) -> dict:
-    """Helper to hide sensitive keys in logs"""
     redacted = dict(args_dict)
     for key in ["openrouter_api_key", "api_key", "token", "password", "secret"]:
         if key in redacted and redacted[key]:
@@ -1219,15 +1229,16 @@ def main():
     parser.add_argument("--openrouter-api-key", default=os.environ.get("OPENROUTER_API_KEY", ""))
     parser.add_argument("--openrouter-site-url", default=os.environ.get("OPENROUTER_SITE_URL", ""))
     parser.add_argument("--openrouter-site-name", default=os.environ.get("OPENROUTER_SITE_NAME", "AdaptiveSD"))
+    parser.add_argument("--plot-dir", default="plots", help="Directory to save PNG plots")
     args = parser.parse_args()
-    
+
     setup_logging(log_file=args.log_file, verbose=args.verbose)
     main_logger.info("Starting Adaptive Speculative Decoding engine")
     main_logger.info("Arguments: %s", _redact_args(vars(args)))
-    
+
     policy_map = {"heuristic": PolicyType.HEURISTIC, "bandit": PolicyType.BANDIT,
                   "ema": PolicyType.EMA, "ensemble": PolicyType.ENSEMBLE}
-    
+
     engine = AdaptiveInferenceEngine(
         model_path=args.model,
         draft_model_path=args.draft_model,
@@ -1240,10 +1251,10 @@ def main():
         openrouter_site_url=args.openrouter_site_url or None,
         openrouter_site_name=args.openrouter_site_name or None,
     )
-    
+
     try:
         if args.benchmark:
-            engine.benchmark()
+            engine.benchmark(plot_dir=args.plot_dir)
         elif args.interactive:
             print("Interactive Mode. Type 'quit' to exit.\n")
             while True:
@@ -1274,6 +1285,7 @@ def main():
                     "Give a structured explanation of backpropagation and gradient descent.",
                 ],
                 tokens_each=128,
+                plot_dir=args.plot_dir,
             )
     finally:
         engine.close()
