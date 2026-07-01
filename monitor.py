@@ -1,18 +1,7 @@
 """
 Module 1: Runtime Monitoring Engine — FIXED
 
-Bugs fixed vs original:
-1. entropy defaults to _entropy_ema (rolling EMA) when no logits or sim_entropy
-   provided (real GGUF path). Original defaulted to 0.0, making entropy-based
-   controller rules (entropy_high / entropy_low) permanently blind.
-2. committed count on AR-only steps (drafted == 0): original still did
-   accepted + 1 = 0 + 1 = 1 which is correct, but `accepted` could be passed
-   as a negative value from callers; clamped to >= 0 now.
-3. `total_sync_latency_ms` write in accept_tokens (kv_cache) was outside the
-   lock; unrelated here, but the snapshot build inside `with self._lock` now
-   reads only self-consistent state by ordering reads before the lock block.
-4. get_ttft_ms uses generation_start_time if set, falling back to _start_time,
-   so TTFT is never contaminated by model-load time.
+
 """
 import time
 import threading
@@ -49,12 +38,16 @@ class InferenceSnapshot:
     speculation_depth: int
     phase: str
     stability_cv: float
+    # ── NEW efficiency metrics (memory-constraint framing) ────────────────
+    itl_variance_ms2: float = 0.0        # Variance of inter-token latency (ms²)
+    itl_cv: float = 0.0                  # CV of ITL = σ_ITL / μ_ITL  (latency stability)
+    wasted_compute_fraction: float = 0.0  # N_wasted / (N_committed + N_wasted)
 
 
 @dataclass
 class MonitorConfig:
     window_size: int = 50
-    poll_interval_s: float = 0.05
+    poll_interval_s: float = 0.2
     entropy_ema_alpha: float = 0.1
     bandwidth_ema_alpha: float = 0.2
     latency_spike_threshold_ms: float = 150.0
@@ -244,6 +237,20 @@ class RuntimeMonitor:
         tail_ratio = (p95 / mean_itl) if mean_itl > 0 else 1.0
         stability = self._compute_stability()
 
+        # NEW: ITL variance and coefficient of variation
+        itl_list = list(self._itl_history)
+        if len(itl_list) >= 2:
+            itl_var = sum((x - mean_itl) ** 2 for x in itl_list) / (len(itl_list) - 1)
+            itl_cv_val = math.sqrt(itl_var) / mean_itl if mean_itl > 0 else 0.0
+        else:
+            itl_var = 0.0
+            itl_cv_val = 0.0
+
+        # Wasted compute fraction (cumulative)
+        total_wasted_so_far = max(0, self._total_drafted - self._total_accepted)
+        denom_wc = self._total_tokens_committed + total_wasted_so_far
+        wasted_frac = total_wasted_so_far / denom_wc if denom_wc > 0 else 0.0
+
         if simulated_cpu is not None:
             self._simulated_cpu = simulated_cpu
             self._cpu_percent = simulated_cpu
@@ -275,6 +282,9 @@ class RuntimeMonitor:
                 speculation_depth=speculation_depth,
                 phase=self._phase,
                 stability_cv=stability,
+                itl_variance_ms2=itl_var,
+                itl_cv=itl_cv_val,
+                wasted_compute_fraction=wasted_frac,
             )
             self._snapshots.append(snap)
             self._phase_snapshots[self._phase].append(snap)
@@ -426,6 +436,12 @@ class RuntimeMonitor:
             "total_speculative_steps": self._total_steps if has_speculation else 0,
             "speculation_active": has_speculation,
             "sample_sufficient": sample_sufficient,
+            # ── NEW efficiency-framing metrics ────────────────────────────
+            "itl_variance_ms2": round(sum((x - mean_itl)**2 for x in self._itl_history) / max(1, len(self._itl_history) - 1), 2) if len(self._itl_history) >= 2 else 0.0,
+            "itl_cv": round(math.sqrt(sum((x - mean_itl)**2 for x in self._itl_history) / max(1, len(self._itl_history) - 1)) / mean_itl if mean_itl > 0 and len(self._itl_history) >= 2 else 0.0, 4),
+            "wasted_compute_fraction": round(max(0, total_wasted) / max(1, self._total_tokens_committed + max(0, total_wasted)), 4),
+            "compute_efficiency": round(efficiency, 4) if has_speculation else 1.0,
+            # ─────────────────────────────────────────────────────────────
             "scientific_validity": {
                 "speculation_metrics_valid": has_speculation,
                 "sample_size_sufficient": sample_sufficient,

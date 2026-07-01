@@ -1143,6 +1143,10 @@ class AdaptiveInferenceEngine:
                 itl_series=list(self._ts_itl),
                 cpu_series=list(self._ts_cpu),
                 entropy_series=list(self._ts_entropy),
+                itl_cv=ev.get("itl_cv", 0.0),
+                itl_variance_ms2=ev.get("itl_variance_ms2", 0.0),
+                wasted_compute_fraction=ev.get("wasted_compute_fraction", 0.0),
+                compute_efficiency=ev.get("compute_efficiency", 0.0),
             ))
 
         self._print_benchmark_summary(results)

@@ -60,6 +60,11 @@ class RunRecord:
     itl_series: List[float] = None
     cpu_series: List[float] = None
     entropy_series: List[float] = None
+    # NEW: efficiency-framing metrics
+    itl_cv: float = 0.0
+    itl_variance_ms2: float = 0.0
+    wasted_compute_fraction: float = 0.0
+    compute_efficiency: float = 0.0
 
     def __post_init__(self):
         for attr in ("tps_series", "acceptance_series", "depth_series",
@@ -100,6 +105,116 @@ def _save(fig, path: str):
     plt.close(fig)
     logger.info("Plot saved → %s", path)
     print(f"  [PLOT] Saved: {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Plot 00 – Memory-Efficiency Dashboard (PRIMARY — new narrative framing)
+#  Replaces throughput-speedup as the lead figure. Shows:
+#  (1) Wasted Compute Fraction  (2) ITL Coefficient of Variation
+#  (3) Compute Efficiency %      (4) Tail-Latency Ratio (P95/Mean)
+#  (5) Speculative Efficiency    (6) Acceptance Rate
+#  Thesis: the framework minimises wasted computation and latency variance
+#  under CPU memory-bandwidth constraints, even when absolute speedup < 1.
+# ═══════════════════════════════════════════════════════════════════════════════
+def plot_efficiency_dashboard(runs: List[RunRecord], out_dir: str, tag: str = "") -> str:
+    """Plot 00: Memory-efficiency-framed primary dashboard."""
+    if not _MPL_AVAILABLE or not runs:
+        return ""
+
+    labels = [f"Run {i+1}" for i in range(len(runs))]
+    x = np.arange(len(runs))
+    bar_w = 0.5
+
+    fig = plt.figure(figsize=(14, 9), facecolor="white")
+    fig.suptitle(
+        f"AdaptiveSD — Memory-Efficiency Dashboard{' [' + tag + ']' if tag else ''}\n"
+        "Primary metric: minimise wasted compute and latency variance under CPU memory-bandwidth constraints",
+        fontsize=11, fontweight="bold", y=0.99
+    )
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.50, wspace=0.40)
+
+    # ── Panel 1: Wasted Compute Fraction ──────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    wcf_vals = [r.wasted_compute_fraction * 100 for r in runs]
+    bars1 = ax1.bar(x, wcf_vals, bar_w, color=_PAL["orange"], alpha=0.85, zorder=3)
+    ax1.set_ylim(0, 60)
+    ax1.axhline(25, color=_PAL["gray"], ls="--", lw=0.9, label="25% reference")
+    ax1.legend(fontsize=7)
+    for bar, v in zip(bars1, wcf_vals):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+    ax1.set_xticks(x); ax1.set_xticklabels(labels, fontsize=7)
+    _style(ax1, "Wasted Compute Fraction", "", "% of drafted tokens wasted")
+
+    # ── Panel 2: Compute Efficiency % ────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    eff_vals = [r.compute_efficiency * 100 for r in runs]
+    colors2 = [_PAL["green"] if e >= 75 else _PAL["orange"] for e in eff_vals]
+    bars2 = ax2.bar(x, eff_vals, bar_w, color=colors2, alpha=0.85, zorder=3)
+    ax2.set_ylim(0, 110)
+    ax2.axhline(75, color=_PAL["gray"], ls="--", lw=0.9, label="75% target")
+    ax2.legend(fontsize=7)
+    for bar, v in zip(bars2, eff_vals):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels, fontsize=7)
+    _style(ax2, "Compute Efficiency  (1 − WCF)", "", "%")
+
+    # ── Panel 3: ITL Coefficient of Variation ─────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    cv_vals = [r.itl_cv for r in runs]
+    colors3 = [_PAL["red"] if cv > 1.5 else _PAL["teal"] for cv in cv_vals]
+    bars3 = ax3.bar(x, cv_vals, bar_w, color=colors3, alpha=0.85, zorder=3)
+    ax3.axhline(1.5, color=_PAL["red"], ls="--", lw=0.9, label="CV=1.5 threshold")
+    ax3.legend(fontsize=7)
+    for bar, v in zip(bars3, cv_vals):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                 f"{v:.2f}", ha="center", va="bottom", fontsize=7)
+    ax3.set_xticks(x); ax3.set_xticklabels(labels, fontsize=7)
+    _style(ax3, "ITL Coeff. of Variation  σ/μ", "", "CV  (lower = more stable)")
+
+    # ── Panel 4: Tail-Latency Ratio P95/Mean ─────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0])
+    tlr_vals = [r.p95_itl_ms / r.mean_itl_ms if r.mean_itl_ms > 0 else 1.0 for r in runs]
+    colors4 = [_PAL["red"] if t > 2.5 else _PAL["green"] for t in tlr_vals]
+    bars4 = ax4.bar(x, tlr_vals, bar_w, color=colors4, alpha=0.85, zorder=3)
+    ax4.axhline(2.5, color=_PAL["gray"], ls="--", lw=0.9, label="P95/Mean = 2.5×")
+    ax4.legend(fontsize=7)
+    for bar, v in zip(bars4, tlr_vals):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                 f"{v:.2f}×", ha="center", va="bottom", fontsize=7)
+    ax4.set_xticks(x); ax4.set_xticklabels(labels, fontsize=7)
+    _style(ax4, "Tail-Latency Ratio  P95 / Mean", "", "ratio  (lower = more stable)")
+
+    # ── Panel 5: Speculative Efficiency % ────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 1])
+    se_vals = [(r.speculative_efficiency or 0.0) * 100 for r in runs]
+    bars5 = ax5.bar(x, se_vals, bar_w, color=_PAL["purple"], alpha=0.85, zorder=3)
+    ax5.set_ylim(0, 110)
+    ax5.axhline(68, color=_PAL["gray"], ls="--", lw=0.9, label="Sim baseline 68%")
+    ax5.legend(fontsize=7)
+    for bar, v in zip(bars5, se_vals):
+        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+    ax5.set_xticks(x); ax5.set_xticklabels(labels, fontsize=7)
+    _style(ax5, "Speculative Efficiency  N_committed / N_total", "", "%")
+
+    # ── Panel 6: Draft Acceptance Rate ────────────────────────────────────
+    ax6 = fig.add_subplot(gs[1, 2])
+    acc_vals = [r.avg_acceptance * 100 for r in runs]
+    bars6 = ax6.bar(x, acc_vals, bar_w, color=_PAL["blue"], alpha=0.85, zorder=3)
+    ax6.set_ylim(0, 110)
+    ax6.axhline(50, color=_PAL["gray"], ls="--", lw=0.8, label="50% line")
+    ax6.legend(fontsize=7)
+    for bar, v in zip(bars6, acc_vals):
+        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+    ax6.set_xticks(x); ax6.set_xticklabels(labels, fontsize=7)
+    _style(ax6, "Draft Acceptance Rate", "", "%")
+
+    path = os.path.join(out_dir, f"00_efficiency_dashboard{tag}.png")
+    _save(fig, path)
+    return path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -556,6 +671,9 @@ def generate_all_plots(runs: List[RunRecord], out_dir: str, tag: str = "") -> Li
     print(f"{'─'*60}")
 
     saved = []
+    p = plot_efficiency_dashboard(runs, out_dir, tag)   # NEW — lead figure
+    if p: saved.append(p)
+
     p = plot_overview_dashboard(runs, out_dir, tag)
     if p: saved.append(p)
 

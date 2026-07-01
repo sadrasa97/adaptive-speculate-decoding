@@ -22,11 +22,11 @@ class SpeculationMode(Enum):
 @dataclass
 class DraftControllerConfig:
     min_depth: int = 1
-    max_depth: int = 4  # FIX: Reduced for CPU-constrained environments
-    initial_depth: int = 2  # FIX: Start conservative
+    max_depth: int = 4  
+    initial_depth: int = 2  
     acceptance_high: float = 0.65
-    acceptance_low: float = 0.25  # FIX: Lower threshold for CPU
-    acceptance_disable: float = 0.05  # FIX: More aggressive disable
+    acceptance_low: float = 0.25  
+    acceptance_disable: float = 0.05  
     cpu_high: float = 0.85
     cpu_critical: float = 0.95
     entropy_high: float = 8.5
@@ -42,6 +42,8 @@ class DraftControllerConfig:
     oscillation_threshold: int = 3  # FIX: Lower threshold
     max_oscillation_suppressions: int = 3
     policy_confidence_threshold: float = 0.60
+    # NEW: Latency variance control (supports efficiency-framing narrative)
+    itl_cv_threshold: float = 1.5   # Reduce depth when CV(ITL) exceeds this
 
 @dataclass
 class ControlDecision:
@@ -75,9 +77,9 @@ class AdaptiveDraftController:
         
         self._decision_counts = {reason: 0 for reason in [
             "cpu_critical", "acceptance_collapsed", "ctx_very_long",
-            "bandwidth_saturated", "latency_spike", "cpu_high",
-            "entropy_spike_high", "low_acceptance", "conditions_favorable",
-            "recovery", "steady_state", "no_data_yet",
+            "bandwidth_saturated", "latency_spike", "itl_cv_spike",
+            "cpu_high", "entropy_spike_high", "low_acceptance",
+            "conditions_favorable", "recovery", "steady_state", "no_data_yet",
             "oscillation_suppressed", "context_pressure",
             "policy_suggestion_rejected", "policy_suggestion_accepted"
         ]}
@@ -106,7 +108,24 @@ class AdaptiveDraftController:
         self._ema_cpu = self._ema(self._ema_cpu, snap.cpu_utilization)
         self._ema_entropy = self._ema(self._ema_entropy, snap.token_entropy)
         
-        # Oscillation detection
+        # Rule 1: CPU critical — checked BEFORE oscillation suppression.
+        # Safety disables must never be masked by the oscillation-suppression
+        # path; otherwise an overloaded-but-oscillating system can stay
+        # speculating at a "settled" depth instead of shedding load.
+        if self._ema_cpu >= self.cfg.cpu_critical:
+            self._bad_steps_cpu += 1
+            return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "cpu_critical")
+        self._bad_steps_cpu = 0
+        
+        # Rule 2: acceptance collapse — same priority reasoning as Rule 1.
+        if self._ema_acceptance < self.cfg.acceptance_disable:
+            self._bad_steps_acceptance += 1
+            if self._bad_steps_acceptance >= self.cfg.bad_steps_to_disable:
+                return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "acceptance_collapsed")
+        else:
+            self._bad_steps_acceptance = 0
+
+        # Oscillation detection (after safety disables, before tuning rules)
         if len(self._depth_history) >= self.cfg.oscillation_window:
             oscillations = self._count_oscillations()
             if oscillations >= self.cfg.oscillation_threshold:
@@ -114,20 +133,6 @@ class AdaptiveDraftController:
                 if self._oscillation_suppressions < self.cfg.max_oscillation_suppressions:
                     self._oscillation_suppressions += 1
                     return self._suppress_oscillation()
-        
-        # Rule 1: CPU critical
-        if self._ema_cpu >= self.cfg.cpu_critical:
-            self._bad_steps_cpu += 1
-            return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "cpu_critical")
-        self._bad_steps_cpu = 0
-        
-        # Rule 2: acceptance collapse
-        if self._ema_acceptance < self.cfg.acceptance_disable:
-            self._bad_steps_acceptance += 1
-            if self._bad_steps_acceptance >= self.cfg.bad_steps_to_disable:
-                return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "acceptance_collapsed")
-        else:
-            self._bad_steps_acceptance = 0
         
         # Rule 3: very long context
         if snap.context_length >= self.cfg.ctx_very_long:
@@ -155,6 +160,15 @@ class AdaptiveDraftController:
         if snap.latency_ms > self._calibrated_latency_threshold and self._can_change() and self.monitor._total_steps > 10:
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "latency_spike")
+
+        # Rule 5.5: ITL coefficient-of-variation spike (NEW — latency variance control)
+        # When latency variance is high (CV > threshold), deeper drafting amplifies
+        # the variance because each verification step incurs higher tail latency.
+        # Reducing depth trades marginal throughput for stability.
+        if (hasattr(snap, 'itl_cv') and snap.itl_cv > self.cfg.itl_cv_threshold
+                and self._can_change() and self.monitor._total_steps > 10):
+            new_depth = max(self.cfg.min_depth, self._depth - 1)
+            return self._adjust_depth(new_depth, "itl_cv_spike")
         
         # Rule 6: high CPU
         if self._ema_cpu >= self.cfg.cpu_high and self._can_change():
