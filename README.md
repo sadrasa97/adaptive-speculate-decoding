@@ -1,183 +1,220 @@
-# Adaptive Speculative Decoding for CPU‑Constrained GGUF Models
+# Adaptive Speculative Decoding for CPU-Constrained GGUF Models
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+AdaptiveSD is an experimental framework for evaluating adaptive speculative decoding under CPU and memory-bandwidth constraints.
 
-A production‑ready framework that accelerates large language model inference on CPU‑limited systems using **adaptive speculative decoding**. It dynamically adjusts draft depth, selects the optimal policy, and monitors runtime metrics to maximise throughput while minimising latency variance and wasted compute—even when absolute speedup is modest.
+It includes:
+- A runtime monitor for TPS, latency, acceptance, CPU, and stability metrics.
+- An adaptive draft-depth controller with safety guards and oscillation suppression.
+- Multiple policy modes (AdaptiveSD variants plus baseline approximations).
+- KV-cache coordination with draft quantization and rollback accounting.
+- Benchmarking utilities, comparison tables, and publication-ready plots.
 
----
+Repository: https://github.com/sadrasa97/adaptive-speculate-decoding/
 
-## 🚀 Key Features
+## Why this project
 
-- **Real & Simulation Backends** – Run with `llama-cpp-python` (GGUF), [OpenRouter](https://openrouter.ai/) API, or a fully synthetic simulation (for testing without hardware).
-- **Adaptive Draft Control** – Adjusts speculation depth based on CPU load, acceptance rate, entropy, context length, and even ITL coefficient of variation.
-- **Multiple Policy Engines** – Choose from *Heuristic*, *Bandit*, *EMA*, or *Ensemble* to decide the draft depth.
-- **KV Cache Coordination** – Quantises draft KV entries (INT8) for memory efficiency, with hit/miss tracking and rollback support.
-- **Rich Runtime Monitoring** – Tracks TPS, inter‑token latency (ITL), CPU utilisation, memory bandwidth, entropy, and more.
-- **Publication‑Ready Visualisations** – Generates PNG plots: efficiency dashboard, overview, time‑series, controller analysis, policy analysis, KV stats, and phase breakdown.
-- **Scientific Validation** – Provides sanity checks, baseline TPS measurement, and confidence in speculative efficiency metrics.
+Most speculative decoding write-ups focus on throughput gains. This project additionally emphasizes efficiency and stability under constrained CPU environments:
+- Wasted compute fraction (WCF).
+- Inter-token latency variability (ITL CV).
+- Tail latency behavior.
+- AR-fallback contamination tracking.
 
----
+This makes it easier to report realistic behavior when speedup is sub-unity on a given backend.
 
-## 🏗️ Architecture Overview
+## Project structure
 
-The system is modular, with five core components:
+- main entrypoint: `main.py`
+- monitoring and metrics: `monitor.py`
+- adaptive control logic: `draft_controller.py`
+- policy engine and baselines: `policy_engine.py`
+- KV cache coordination: `kv_cache.py`
+- plotting and export utilities: `visualizer.py`
+- hardware spec collector (Windows): `collect_hw_specs.ps1`
+- generated outputs: `plots/`
 
-| Module | Responsibility |
-|--------|----------------|
-| `monitor.py` | Runtime monitoring: collects snapshots of TPS, latency, CPU, entropy, ITL variance, etc. |
-| `draft_controller.py` | Adaptive draft depth controller with oscillation detection and safety rules. |
-| `policy_engine.py` | Policy selection (Heuristic / Bandit / EMA / Ensemble) and workload detection. |
-| `kv_cache.py` | KV cache coordination with INT8 quantisation, shadow buffer, and hit/miss tracking. |
-| `main.py` | Main inference engine, command‑line interface, benchmarking, and plotting. |
-| `visualizer.py` | Generates multi‑panel PNG plots from benchmark runs. |
+## Features
 
----
+- Backends:
+  - `gguf` via `llama-cpp-python`.
+  - `openrouter` via HTTP API.
+  - `simulation` for controlled experiments without local model files.
+- Policies:
+  - `ensemble`, `bandit`, `ema`, `heuristic`
+  - `fixed_depth`, `parallel_sd`, `dynamic_lookahead`, `specdec_plus_approx`
+- Experiment modes:
+  - single prompt generation
+  - benchmark mode with repeats and CI reporting
+  - cross-method comparison mode with table/plot export
+  - interactive shell mode
 
-## 📦 Installation
+## Requirements
 
-### Prerequisites
-- Python 3.9+
-- (Optional) A GGUF model file (e.g. from [Hugging Face](https://huggingface.co/models?search=gguf)) and `llama-cpp-python`
-- (Optional) An OpenRouter API key
+- Python 3.10+
+- Windows, Linux, or macOS (this repo currently includes a Windows hardware script)
+- Python packages:
+  - numpy
+  - psutil
+  - python-dotenv
+  - matplotlib
+  - llama-cpp-python (optional, required for GGUF backend)
 
-### Steps
-```bash
-# Clone the repository
-git clone https://github.com/sadrasa97/adaptive-speculative-decoding.git
-cd adaptive-speculative-decoding
-
-# Create a virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
-
-# Install dependencies
-pip install -r requirements.txt
-
-# (Optional) Install llama-cpp-python with CPU optimisations
-pip install llama-cpp-python
-```
-
-### `requirements.txt` example
-```
-numpy>=1.24.0
-psutil>=5.9.0
-matplotlib>=3.6.0
-python-dotenv>=1.0.0
-```
-
-> **Note**: `llama-cpp-python` is not required if you use simulation or OpenRouter.
-
----
-
-## 🧪 Usage
-
-### Command‑Line Interface
+Install example:
 
 ```bash
-python main.py [options]
+pip install numpy psutil python-dotenv matplotlib llama-cpp-python
 ```
 
-**Basic examples**:
-- Run a single prompt with real GGUF models:
-  ```bash
-  python main.py --model /path/to/target.gguf --draft-model /path/to/draft.gguf --prompt "Write a Python quicksort" --max-tokens 200
-  ```
-- Run benchmark on default prompts (simulation if no model):
-  ```bash
-  python main.py --benchmark
-  ```
-- Interactive chat:
-  ```bash
-  python main.py --interactive
-  ```
-- Use OpenRouter backend:
-  ```bash
-  python main.py --backend openrouter --openrouter-api-key $OPENROUTER_API_KEY --openrouter-model openai/gpt-4o-mini --prompt "Explain quantum computing"
-  ```
+If you only want simulation mode:
 
-### Key Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `--model` | Path to target GGUF model. |
-| `--draft-model` | Path to draft GGUF model. |
-| `--prompt` | Input prompt (if not using interactive/benchmark). |
-| `--max-tokens` | Maximum tokens to generate (default 256). |
-| `--temperature` | Sampling temperature (default 0.7). |
-| `--depth` | Initial draft depth (default 4). |
-| `--n-ctx` | Context size (default 4096). |
-| `--threads` | Number of CPU threads (0 = auto). |
-| `--policy` | Policy type: `heuristic`, `bandit`, `ema`, `ensemble` (default: `ensemble`). |
-| `--backend` | `auto`, `gguf`, `openrouter`, `simulation`. |
-| `--benchmark` | Run benchmark on a set of prompts. |
-| `--interactive` | Start interactive chat session. |
-| `--plot-dir` | Directory to save PNG plots (default `plots`). |
-
-See `python main.py --help` for all options.
-
----
-
-## 📊 Output & Visualisations
-
-When running benchmarks, the system:
-1. Prints a **diagnostic sanity check** to verify correctness of speculative metrics.
-2. Displays a **comprehensive evaluation** including throughput, latency percentiles, efficiency, and phase breakdown.
-3. Saves **PNG plots** in the specified plot directory:
-   - `00_efficiency_dashboard.png` – primary figure highlighting wasted compute and ITL CV.
-   - `01_overview_dashboard.png` – TPS, speedup, acceptance, latency, efficiency, draft token budget.
-   - `02_timeseries_run*.png` – per‑step TPS, ITL, acceptance, depth, CPU, entropy.
-   - `03_controller_analysis.png` – decision reasons and depth distribution.
-   - `04_policy_analysis.png` – EMA rewards, policy contribution, reward/regret.
-   - `05_kv_cache.png` – hit rate, rollbacks, compression, memory pressure.
-   - `06_phase_latency.png` – phase breakdown and latency percentiles.
-
-If both GGUF and simulation runs exist, `07_backend_comparison.png` is also generated.
-
----
-
-## ⚙️ How It Works (Brief)
-
-1. **Baseline TPS Measurement** – The engine first measures the target model’s throughput without speculation to establish a reference.
-2. **Draft Generation** – The draft model proposes a sequence of `depth` tokens.
-3. **Verification** – The target model processes the draft tokens one by one; if a token matches, it is accepted; otherwise, the first mismatch is corrected.
-4. **KV Cache** – Draft KV entries are quantised and stored; accepted tokens are synced, rejected tokens are rolled back.
-5. **Monitoring** – Every step records TPS, ITL, CPU, entropy, acceptance ratio, ITL variance, and more.
-6. **Adaptive Control** – The draft controller uses EMA‑filtered metrics to adjust depth and mode (disabled/conservative/normal/aggressive) based on safety rules.
-7. **Policy Engine** – The selected policy (heuristic, bandit, EMA, or ensemble) suggests a depth, which the controller may adopt if confidence is high.
-8. **Workload Detection** – The policy engine classifies the prompt (coding, reasoning, chat, creative) and adapts accordingly.
-
----
-
-## 🧠 Design Philosophy
-
-- **Memory‑Constraint First** – The system is tuned for CPU‑limited environments where memory bandwidth and latency variance matter more than absolute token throughput.
-- **Scientific Rigour** – All metrics are validated with sanity checks; the simulation model is calibrated against real‑world behaviour.
-- **Modularity** – Each component can be swapped or tuned independently.
-- **Extensibility** – The code supports custom policies, backends, and visualisations.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request. For major changes, discuss them first.
-
----
-
-## 📜 License
-
-This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
-
----
-
-## 📚 References
-
-- [LLM Inference on CPU](https://github.com/ggerganov/llama.cpp) – GGUF format and `llama-cpp-python`.
-- OpenRouter – unified API for many LLMs.
-
----
-
-
-
-Built with ❤️ for the open‑source AI community.
+```bash
+pip install numpy psutil python-dotenv matplotlib
 ```
+
+## Quick start
+
+Clone and enter the repo:
+
+```bash
+git clone https://github.com/sadrasa97/adaptive-speculate-decoding/
+cd adaptive-speculate-decoding
+```
+
+### 1. Single prompt run
+
+```bash
+python main.py --backend simulation --prompt "Explain adaptive speculative decoding on CPUs." --max-tokens 128
+```
+
+### 2. Benchmark run (recommended repeats for CI)
+
+```bash
+python main.py --backend simulation --benchmark --repeats 5 --plot-dir plots
+```
+
+### 3. Compare methods on same prompts/backend
+
+```bash
+python main.py --backend simulation --compare-methods --repeats 5 --plot-dir plots
+```
+
+### 4. Long-context comparison
+
+```bash
+python main.py --backend simulation --compare-methods --long-context --repeats 5 --plot-dir plots
+```
+
+### 5. Interactive mode
+
+```bash
+python main.py --backend simulation --interactive
+```
+
+Type `status` in interactive mode to print runtime status JSON.
+
+## Using GGUF backend
+
+By default, `main.py` points to local Windows paths for model and draft model. Override them on your machine:
+
+```bash
+python main.py \
+  --backend gguf \
+  --model /path/to/target.gguf \
+  --draft-model /path/to/draft.gguf \
+  --benchmark --repeats 5
+```
+
+Notes:
+- If `llama-cpp-python` is not installed or model path is invalid, backend may fall back to simulation.
+- If draft model cannot be loaded, runs continue in non-speculative autoregressive path.
+
+## Using OpenRouter backend
+
+Set environment variables (or pass CLI flags):
+
+```bash
+export OPENROUTER_API_KEY=your_key
+export OPENROUTER_MODEL=openrouter/free
+python main.py --backend openrouter --benchmark --repeats 5
+```
+
+PowerShell example:
+
+```powershell
+$env:OPENROUTER_API_KEY="your_key"
+$env:OPENROUTER_MODEL="openrouter/free"
+python main.py --backend openrouter --benchmark --repeats 5
+```
+
+## CLI reference
+
+Key arguments from `main.py`:
+
+- `--backend {auto,gguf,openrouter,simulation}`
+- `--policy {heuristic,bandit,ema,ensemble,fixed_depth,parallel_sd,dynamic_lookahead,specdec_plus_approx}`
+- `--benchmark`
+- `--compare-methods`
+- `--long-context`
+- `--interactive`
+- `--prompt <text>`
+- `--max-tokens <int>`
+- `--repeats <int>` (use 5+ for more defensible CI)
+- `--plot-dir <path>`
+- `--model <path>` and `--draft-model <path>`
+- OpenRouter options: `--openrouter-api-key`, `--openrouter-model`, `--openrouter-base-url`, `--openrouter-site-url`, `--openrouter-site-name`
+
+## Outputs
+
+Typical outputs include:
+
+- per-method benchmark plots under `plots/<method>/`
+- cross-method comparison assets under `plots/_comparison/`
+- markdown/latex comparison table exports
+- `comparison_summary.json` for downstream reporting
+- run log file (default: `adaptive_sd.log`)
+
+## Reproducibility
+
+### Capture machine specs
+
+On Windows PowerShell:
+
+```powershell
+.\collect_hw_specs.ps1
+```
+
+This generates a timestamped `system_specs_YYYYMMDD_HHMMSS.txt` report.
+
+### Validity practices already implemented in this codebase
+
+- Runtime modules are reset between benchmark prompts to avoid cumulative contamination.
+- Non-speculative paths report speculative metrics as unavailable rather than fake placeholders.
+- Baseline source and sample sufficiency are surfaced in outputs.
+- Sensitive CLI args such as API keys are redacted in logs.
+
+## Example snapshot (current repository artifacts)
+
+From `plots/_comparison/comparison_summary.json` (GGUF, repeats=5, 15 runs per method):
+
+- `specdec_plus_approx`: mean TPS 3.78, speedup 0.771x, AR-fallback 13.7%
+- `fixed_depth`: mean TPS 3.25, speedup 0.664x, AR-fallback 46.3%
+- `ensemble`: mean TPS 3.20, speedup 0.653x, AR-fallback 37.3%
+
+Interpretation: on this specific hardware/backend setup, all listed methods are below 1.0x speedup versus no-speculation baseline; the framework still helps compare stability, fallback contamination, and compute-efficiency tradeoffs.
+
+## Known limitations
+
+- Baseline methods `specdec_plus_approx` and `dynamic_lookahead` are rule-based approximations, not full reproductions of original trained systems.
+- Welch t-test p-values use SciPy if available; otherwise the code falls back to a normal approximation.
+- Results are backend- and hardware-sensitive; avoid generalizing from a single machine.
+
+## Suggested workflow for a new experiment
+
+1. Capture hardware snapshot using `collect_hw_specs.ps1`.
+2. Run `--compare-methods --repeats 5` on one backend.
+3. Save `plots/_comparison/*` artifacts.
+4. Re-run on another backend (`gguf` vs `simulation` or `openrouter`) for contrast.
+5. Report both speed and efficiency metrics (WCF, ITL CV, AR-fallback).
+
+## License
+
+No license file is currently present in this repository. Add one if you plan public reuse.
