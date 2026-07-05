@@ -93,9 +93,11 @@ class AdaptiveDraftController:
             self._depth, self.cfg.min_depth, self.cfg.max_depth
         )
     
+
+
     def step(self, snap: Optional[InferenceSnapshot] = None,
-             policy_suggestion: Optional[int] = None,
-             policy_confidence: float = 0.5) -> ControlDecision:
+            policy_suggestion: Optional[int] = None,
+            policy_confidence: float = 0.5) -> ControlDecision:
         if snap is None:
             snap = self.monitor.get_current_snapshot()
         if snap is None:
@@ -104,28 +106,74 @@ class AdaptiveDraftController:
         self._steps_since_change += 1
         self._depth_history.append(self._depth)
         
-        self._ema_acceptance = self._ema(self._ema_acceptance, snap.acceptance_ratio)
-        self._ema_cpu = self._ema(self._ema_cpu, snap.cpu_utilization)
-        self._ema_entropy = self._ema(self._ema_entropy, snap.token_entropy)
+        # EMA updates
+        alpha = self._ema_alpha
+        self._ema_acceptance = alpha * snap.acceptance_ratio + (1.0 - alpha) * self._ema_acceptance
+        self._ema_cpu = alpha * snap.cpu_utilization + (1.0 - alpha) * self._ema_cpu
+        self._ema_entropy = alpha * snap.token_entropy + (1.0 - alpha) * self._ema_entropy
         
-        # Rule 1: CPU critical — checked BEFORE oscillation suppression.
-        # Safety disables must never be masked by the oscillation-suppression
-        # path; otherwise an overloaded-but-oscillating system can stay
-        # speculating at a "settled" depth instead of shedding load.
+        # ═══════════════════════════════════════════════════════════════
+        # CRITICAL FIX: Stronger hysteresis with proper reset
+        # ═══════════════════════════════════════════════════════════════
+        
+        if not hasattr(self, '_consecutive_ineffective_steps'):
+            self._consecutive_ineffective_steps = 0
+        if not hasattr(self, '_consecutive_good_steps'):
+            self._consecutive_good_steps = 0
+        if not hasattr(self, '_last_warning_step'):
+            self._last_warning_step = 0
+        
+        if self.monitor._total_steps > 15 and self.monitor._baseline_tps > 0:
+            current_speedup = snap.tokens_per_sec / self.monitor._baseline_tps
+            
+            # If speculation is ineffective, increment counter
+            if current_speedup < 0.8:
+                self._consecutive_ineffective_steps += 1
+                
+                # Only disable after 5 consecutive ineffective steps
+                if self._consecutive_ineffective_steps >= 5:
+                    if self._mode != SpeculationMode.DISABLED:
+                        # Only log warning ONCE when transitioning to DISABLED
+                        logger.warning(
+                            "Speculation ineffective for %d steps (speedup=%.2fx), disabling",
+                            self._consecutive_ineffective_steps, current_speedup
+                        )
+                        self._last_warning_step = self.monitor._total_steps
+                        # Reset counter after disabling
+                        self._consecutive_ineffective_steps = 0
+                        return self._set(SpeculationMode.DISABLED, 1, "speculation_ineffective_persistent")
+                    else:
+                        # Already disabled, don't log again
+                        # Just return stable decision
+                        return self._make_decision(self._mode, self._depth, "disabled_stable")
+            else:
+                # Speedup improved, reset ineffective counter
+                self._consecutive_ineffective_steps = 0
+                
+                # Only re-enable after 20 consecutive good steps (stronger hysteresis)
+                if self._mode == SpeculationMode.DISABLED:
+                    self._consecutive_good_steps += 1
+                    if self._consecutive_good_steps >= 20:
+                        logger.info("Speculation recovered after %d good steps", self._consecutive_good_steps)
+                        self._consecutive_good_steps = 0
+                        return self._set(SpeculationMode.CONSERVATIVE, self.cfg.initial_depth, "recovery")
+                else:
+                    self._consecutive_good_steps = 0
+        
+        # Safety checks (unchanged)
         if self._ema_cpu >= self.cfg.cpu_critical:
             self._bad_steps_cpu += 1
             return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "cpu_critical")
         self._bad_steps_cpu = 0
         
-        # Rule 2: acceptance collapse — same priority reasoning as Rule 1.
         if self._ema_acceptance < self.cfg.acceptance_disable:
             self._bad_steps_acceptance += 1
             if self._bad_steps_acceptance >= self.cfg.bad_steps_to_disable:
                 return self._set(SpeculationMode.DISABLED, self.cfg.min_depth, "acceptance_collapsed")
         else:
             self._bad_steps_acceptance = 0
-
-        # Oscillation detection (after safety disables, before tuning rules)
+        
+        # Oscillation detection
         if len(self._depth_history) >= self.cfg.oscillation_window:
             oscillations = self._count_oscillations()
             if oscillations >= self.cfg.oscillation_threshold:
@@ -134,19 +182,19 @@ class AdaptiveDraftController:
                     self._oscillation_suppressions += 1
                     return self._suppress_oscillation()
         
-        # Rule 3: very long context
+        # Remaining rules (unchanged)
         if snap.context_length >= self.cfg.ctx_very_long:
             return self._set(SpeculationMode.CONSERVATIVE, max(self.cfg.min_depth, 2), "ctx_very_long")
         
-        # Rule 4: bandwidth saturation
         if snap.memory_bandwidth_mb_s > self.cfg.bandwidth_threshold and self.monitor._total_steps > 15:
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             if self._can_change():
                 return self._adjust_depth(new_depth, "bandwidth_saturated")
         
-        # Rule 5: latency spike
+        # Latency spike detection
         if snap.latency_ms > 0 and self.monitor._total_steps <= 20:
             self._warmup_itl_samples.append(snap.latency_ms)
+        
         if not self._threshold_calibrated and len(self._warmup_itl_samples) >= 10:
             median_itl = sorted(self._warmup_itl_samples)[len(self._warmup_itl_samples) // 2]
             if median_itl > 1.0:
@@ -160,32 +208,24 @@ class AdaptiveDraftController:
         if snap.latency_ms > self._calibrated_latency_threshold and self._can_change() and self.monitor._total_steps > 10:
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "latency_spike")
-
-        # Rule 5.5: ITL coefficient-of-variation spike (NEW — latency variance control)
-        # When latency variance is high (CV > threshold), deeper drafting amplifies
-        # the variance because each verification step incurs higher tail latency.
-        # Reducing depth trades marginal throughput for stability.
+        
         if (hasattr(snap, 'itl_cv') and snap.itl_cv > self.cfg.itl_cv_threshold
                 and self._can_change() and self.monitor._total_steps > 10):
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "itl_cv_spike")
         
-        # Rule 6: high CPU
         if self._ema_cpu >= self.cfg.cpu_high and self._can_change():
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "cpu_high")
         
-        # Rule 7: high entropy
         if self._ema_entropy > self.cfg.entropy_high and self._can_change():
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "entropy_spike_high")
         
-        # Rule 8: low acceptance
         if self._ema_acceptance < self.cfg.acceptance_low and self._can_change():
             new_depth = max(self.cfg.min_depth, self._depth - 1)
             return self._adjust_depth(new_depth, "low_acceptance")
         
-        # Rule 9: favourable conditions
         if (
             self._ema_acceptance > self.cfg.acceptance_high
             and self._ema_cpu < self.cfg.cpu_high * 0.8
@@ -196,28 +236,27 @@ class AdaptiveDraftController:
             new_depth = min(self.cfg.max_depth, self._depth + 1)
             return self._adjust_depth(new_depth, "conditions_favorable")
         
-        # Rule 10: re-enable if disabled
         if self._mode == SpeculationMode.DISABLED:
             if self._ema_acceptance > self.cfg.acceptance_low and self._ema_cpu < self.cfg.cpu_high:
                 self._bad_steps_cpu = 0
                 self._bad_steps_acceptance = 0
-                return self._set(SpeculationMode.CONSERVATIVE, self.cfg.initial_depth, "recovery")
+                # Don't re-enable immediately, wait for recovery condition above
+                return self._make_decision(self._mode, self._depth, "disabled_stable")
         
-        # Rule 11: policy suggestion
         if policy_suggestion is not None and self._can_change():
             clamped = max(self.cfg.min_depth, min(self.cfg.max_depth, policy_suggestion))
             if clamped != self._depth and policy_confidence >= self.cfg.policy_confidence_threshold:
                 if self._is_safe_suggestion(clamped, snap):
                     return self._adjust_depth(clamped, "policy_suggestion_accepted")
                 else:
-                    # Count rejection in decision stats (via _make_decision below)
                     self._decision_counts["policy_suggestion_rejected"] = (
                         self._decision_counts.get("policy_suggestion_rejected", 0) + 1
                     )
         
         self._mode = self._depth_to_mode(self._depth)
         return self._make_decision(self._mode, self._depth, "steady_state")
-    
+
+
     def _is_safe_suggestion(self, suggested_depth: int, snap: InferenceSnapshot) -> bool:
         if self._oscillation_count > 2:
             return False
